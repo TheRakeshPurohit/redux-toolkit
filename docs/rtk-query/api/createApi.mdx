@@ -16,6 +16,11 @@ description: 'RTK Query > API: createApi reference'
 
 Typically, you should only have one API slice per base URL that your application needs to communicate with. For example, if your site fetches data from both `/api/posts` and `/api/users`, you would have a single API slice with `/api/` as the base URL, and separate endpoint definitions for `posts` and `users`. This allows you to effectively take advantage of [automated re-fetching](../usage/automated-refetching.mdx) by defining [tag](../usage/automated-refetching.mdx#tags) relationships across endpoints.
 
+This is because:
+
+- Automatic tag invalidation only works within a single API slice. If you have multiple API slices, the automatic invalidation won't work across them.
+- Every `createApi` call generates its own middleware, and each middleware added to the store will run checks against every dispatched action. That has a perf cost that adds up. So, if you called `createApi` 10 times and added 10 separate API middleware to the store, that will be noticeably slower perf-wise.
+
 For maintainability purposes, you may wish to split up endpoint definitions across multiple files, while still maintaining a single API slice which includes all of these endpoints. See [code splitting](../usage/code-splitting.mdx) for how you can use the `injectEndpoints` property to inject API endpoints from other files into a single API slice definition.
 
 :::
@@ -34,8 +39,8 @@ import type { Pokemon } from './types'
 export const pokemonApi = createApi({
   reducerPath: 'pokemonApi',
   baseQuery: fetchBaseQuery({ baseUrl: 'https://pokeapi.co/api/v2/' }),
-  endpoints: (builder) => ({
-    getPokemonByName: builder.query<Pokemon, string>({
+  endpoints: (build) => ({
+    getPokemonByName: build.query<Pokemon, string>({
       query: (name) => `pokemon/${name}`,
     }),
   }),
@@ -49,7 +54,7 @@ export const { useGetPokemonByNameQuery } = pokemonApi
 // highlight-end
 ```
 
-## Parameters
+## `createApi` Parameters
 
 `createApi` accepts a single configuration object parameter with the following options:
 
@@ -57,7 +62,7 @@ export const { useGetPokemonByNameQuery } = pokemonApi
   baseQuery(args: InternalQueryArgs, api: BaseQueryApi, extraOptions?: DefinitionExtraOptions): any;
   endpoints(build: EndpointBuilder<InternalQueryArgs, TagTypes>): Definitions;
   extractRehydrationInfo?: (
-    action: AnyAction,
+    action: UnknownAction,
     {
       reducerPath,
     }: {
@@ -88,9 +93,10 @@ export const { useGetPokemonByNameQuery } = pokemonApi
   - `dispatch` - The `store.dispatch` method for the corresponding Redux store
   - `getState` - A function that may be called to access the current store state
   - `extra` - Provided as thunk.extraArgument to the configureStore getDefaultMiddleware option.
-  - `endpoint` - The name of the endpoint. 
+  - `endpoint` - The name of the endpoint.
   - `type` - Type of request (`query` or `mutation`).
   - `forced` - Indicates if a query has been forced.
+  - `queryCacheKey`- The computed query cache key.
 - `extraOptions` - The value of the optional `extraOptions` property provided for a given endpoint
 
 #### baseQuery function signature
@@ -101,11 +107,11 @@ export type BaseQueryFn<
   Result = unknown,
   Error = unknown,
   DefinitionExtraOptions = {},
-  Meta = {}
+  Meta = {},
 > = (
   args: Args,
   api: BaseQueryApi,
-  extraOptions: DefinitionExtraOptions
+  extraOptions: DefinitionExtraOptions,
 ) => MaybePromise<QueryReturnValue<Result, Error, Meta>>
 
 export interface BaseQueryApi {
@@ -138,9 +144,13 @@ export type QueryReturnValue<T = unknown, E = unknown, M = unknown> =
 
 [summary](docblock://query/createApi.ts?token=CreateApiOptions.endpoints)
 
-See [Anatomy of an endpoint](#anatomy-of-an-endpoint) for details on individual properties.
+See [Endpoint Definition Parameters](#endpoint-definition-parameters) for details on individual properties.
 
 #### Query endpoint definition
+
+Query endpoints (defined with `build.query()`) are used to cache data fetched from the server.
+
+You must specify either a `query` field (which will use the API's `baseQuery` to make a request), or a `queryFn` function with your own async logic. All other fields are optional.
 
 ```ts title="Query endpoint definition" no-transpile
 export type QueryDefinition<
@@ -148,7 +158,7 @@ export type QueryDefinition<
   BaseQuery extends BaseQueryFn,
   TagTypes extends string,
   ResultType,
-  ReducerPath extends string = string
+  ReducerPath extends string = string,
 > = {
   query(arg: QueryArg): BaseQueryArg<BaseQuery>
 
@@ -157,21 +167,21 @@ export type QueryDefinition<
     arg: QueryArg,
     api: BaseQueryApi,
     extraOptions: BaseQueryExtraOptions<BaseQuery>,
-    baseQuery: (arg: Parameters<BaseQuery>[0]) => ReturnType<BaseQuery>
+    baseQuery: (arg: Parameters<BaseQuery>[0]) => ReturnType<BaseQuery>,
   ): MaybePromise<QueryReturnValue<ResultType, BaseQueryError<BaseQuery>>>
 
   /* transformResponse only available with `query`, not `queryFn` */
   transformResponse?(
     baseQueryReturnValue: BaseQueryResult<BaseQuery>,
     meta: BaseQueryMeta<BaseQuery>,
-    arg: QueryArg
+    arg: QueryArg,
   ): ResultType | Promise<ResultType>
 
   /* transformErrorResponse only available with `query`, not `queryFn` */
   transformErrorResponse?(
     baseQueryReturnValue: BaseQueryError<BaseQuery>,
     meta: BaseQueryMeta<BaseQuery>,
-    arg: QueryArg
+    arg: QueryArg,
   ): unknown
 
   extraOptions?: BaseQueryExtraOptions<BaseQuery>
@@ -195,7 +205,7 @@ export type QueryDefinition<
       queryFulfilled,
       getCacheEntry,
       updateCachedData, // available for query endpoints only
-    }: QueryLifecycleApi
+    }: QueryLifecycleApi,
   ): Promise<void>
 
   onCacheEntryAdded?(
@@ -209,12 +219,84 @@ export type QueryDefinition<
       cacheDataLoaded,
       getCacheEntry,
       updateCachedData, // available for query endpoints only
-    }: QueryCacheLifecycleApi
+    }: QueryCacheLifecycleApi,
   ): Promise<void>
 }
 ```
 
+#### Infinite Query endpoint definition
+
+Infinite query endpoints (defined with `build.infiniteQuery()`) are used to cache multi-page data sets from the server. They have all the same callbacks and options as standard query endpoints, but also require an additional [`infiniteQueryOptions`](#infinitequeryoptions) field to specify how to calculate the unique parameters to fetch each page.
+
+For infinite query endpoints, there is a separation between the "query arg" used for the cache key, and the "page param" used to fetch a specific page. For example, a Pokemon API endpoint might have a string query arg like `"fire"` , but use a page number as the param to determine which page to fetch out of the results. The `query` and `queryFn` methods will receive a combined `{queryArg, pageParam}` object as the argument, rather than just the `queryArg` by itself.
+
+```ts title="Infinite Query endpoint definition" no-transpile
+export type PageParamFunction<DataType, PageParam> = (
+  firstPage: DataType,
+  allPages: Array<DataType>,
+  firstPageParam: PageParam,
+  allPageParams: Array<PageParam>,
+) => PageParam | undefined | null
+
+type InfiniteQueryCombinedArg<QueryArg, PageParam> = {
+  queryArg: QueryArg
+  pageParam: PageParam
+}
+
+export type InfiniteQueryDefinition<
+  QueryArg,
+  PageParam,
+  BaseQuery extends BaseQueryFn,
+  TagTypes extends string,
+  ResultType,
+  ReducerPath extends string = string,
+> =
+  // Infinite queries have all the same options as query endpoints,
+  // but store the `{pages, pageParams}` structure, and receive an object
+  // with both `{queryArg, pageParam}` as the arg for `query` and `queryFn`.
+  QueryDefinition<
+    InfiniteQueryCombinedArg<QueryArg, PageParam>,
+    BaseQuery,
+    TagTypes,
+    InfiniteData<ResultType>
+  > & {
+    /**
+     * Required options to configure the infinite query behavior.
+     * `initialPageParam` and `getNextPageParam` are required, to
+     * ensure the infinite query can properly fetch the next page of data.
+     * `initialPageparam` may be specified when using the
+     * endpoint, to override the default value.
+     */
+    infiniteQueryOptions: {
+      /**
+       * The initial page parameter to use for the first page fetch.
+       */
+      initialPageParam: PageParam
+      /**
+       * This function is required to automatically get the next cursor for infinite queries.
+       * The result will also be used to determine the value of `hasNextPage`.
+       */
+      getNextPageParam: PageParamFunction<DataType, PageParam>
+      /**
+       * This function can be set to automatically get the previous cursor for infinite queries.
+       * The result will also be used to determine the value of `hasPreviousPage`.
+       */
+      getPreviousPageParam?: PageParamFunction<DataType, PageParam>
+      /**
+       * If specified, only keep this many pages in cache at once.
+       * If additional pages are fetched, older pages in the other
+       * direction will be dropped from the cache.
+       */
+      maxPages?: number
+    }
+  }
+```
+
 #### Mutation endpoint definition
+
+Mutation endpoints (defined with `build.mutation()`) are used to send updates to the server, and force invalidation and refetching of query endpoints.
+
+As with queries, you must specify either the `query` option or the `queryFn` async method.
 
 ```ts title="Mutation endpoint definition" no-transpile
 export type MutationDefinition<
@@ -223,7 +305,7 @@ export type MutationDefinition<
   TagTypes extends string,
   ResultType,
   ReducerPath extends string = string,
-  Context = Record<string, any>
+  Context = Record<string, any>,
 > = {
   query(arg: QueryArg): BaseQueryArg<BaseQuery>
 
@@ -232,21 +314,21 @@ export type MutationDefinition<
     arg: QueryArg,
     api: BaseQueryApi,
     extraOptions: BaseQueryExtraOptions<BaseQuery>,
-    baseQuery: (arg: Parameters<BaseQuery>[0]) => ReturnType<BaseQuery>
+    baseQuery: (arg: Parameters<BaseQuery>[0]) => ReturnType<BaseQuery>,
   ): MaybePromise<QueryReturnValue<ResultType, BaseQueryError<BaseQuery>>>
 
   /* transformResponse only available with `query`, not `queryFn` */
   transformResponse?(
     baseQueryReturnValue: BaseQueryResult<BaseQuery>,
     meta: BaseQueryMeta<BaseQuery>,
-    arg: QueryArg
+    arg: QueryArg,
   ): ResultType | Promise<ResultType>
 
   /* transformErrorResponse only available with `query`, not `queryFn` */
   transformErrorResponse?(
     baseQueryReturnValue: BaseQueryError<BaseQuery>,
     meta: BaseQueryMeta<BaseQuery>,
-    arg: QueryArg
+    arg: QueryArg,
   ): unknown
 
   extraOptions?: BaseQueryExtraOptions<BaseQuery>
@@ -262,7 +344,7 @@ export type MutationDefinition<
       requestId,
       queryFulfilled,
       getCacheEntry,
-    }: MutationLifecycleApi
+    }: MutationLifecycleApi,
   ): Promise<void>
 
   onCacheEntryAdded?(
@@ -275,7 +357,7 @@ export type MutationDefinition<
       cacheEntryRemoved,
       cacheDataLoaded,
       getCacheEntry,
-    }: MutationCacheLifecycleApi
+    }: MutationCacheLifecycleApi,
   ): Promise<void>
 }
 ```
@@ -351,6 +433,10 @@ See also [Server Side Rendering](../usage/server-side-rendering.mdx) and
 
 By default, this function will take the query arguments, sort object keys where applicable, stringify the result, and concatenate it with the endpoint name. This creates a cache key based on the combination of arguments + endpoint name (ignoring object key order), such that calling any given endpoint with the same arguments will result in the same cache key.
 
+### `invalidationBehavior`
+
+[summary](docblock://query/createApi.ts?token=CreateApiOptions.invalidationBehavior)
+
 ### `keepUnusedDataFor`
 
 [summary](docblock://query/createApi.ts?token=CreateApiOptions.keepUnusedDataFor)
@@ -383,7 +469,7 @@ You can set this globally in `createApi`, but you can also override the default 
 If you specify `track: false` when manually dispatching queries, RTK Query will not be able to automatically refetch for you.
 :::
 
-## Anatomy of an endpoint
+## Endpoint Definition Parameters
 
 ### `query`
 
@@ -391,7 +477,7 @@ _(required if no `queryFn` provided)_
 
 ```ts title="query signature" no-transpile
 export type query = <QueryArg>(
-  arg: QueryArg
+  arg: QueryArg,
 ) => string | Record<string, unknown>
 
 // with `fetchBaseQuery`
@@ -436,7 +522,7 @@ export interface BaseQueryApi {
 }
 ```
 
-#### queryFn function arguments
+#### `queryFn` function arguments
 
 - `args` - The argument provided when the query itself is called
 - `api` - The `BaseQueryApi` object, containing `signal`, `dispatch` and `getState` properties
@@ -447,6 +533,21 @@ export interface BaseQueryApi {
 - `baseQuery` - The `baseQuery` function provided to the api itself
 
 [examples](docblock://query/endpointDefinitions.ts?token=EndpointDefinitionWithQueryFn.queryFn)
+
+### `infiniteQueryOptions`
+
+_(only for `infiniteQuery` endpoints)_
+
+[summary](docblock://query/endpointDefinitions.ts?token=InfiniteQueryExtraOptions.infiniteQueryOptions)
+
+The `infiniteQueryOptions` field includes:
+
+- `initialPageParam`: the default page param value used for the first request, if this was not specified at the usage site
+- `getNextPageParam`: a required callback you must provide to calculate the next page param, given the existing cached pages and page params
+- `getPreviousPageParam`: an optional callback that will be used to calculate the previous page param, if you try to fetch backwards.
+- `maxPages`: an optional limit to how many fetched pages will be kept in the cache entry at a time
+
+[examples](docblock://query/endpointDefinitions.ts?token=InfiniteQueryExtraOptions.infiniteQueryOptions)
 
 ### `transformResponse`
 
@@ -579,7 +680,7 @@ async function onQueryStarted(
     requestId,
     queryFulfilled,
     getCacheEntry,
-  }: MutationLifecycleApi
+  }: MutationLifecycleApi,
 ): Promise<void>
 ```
 
@@ -594,7 +695,7 @@ async function onQueryStarted(
     queryFulfilled,
     getCacheEntry,
     updateCachedData, // available for query endpoints only
-  }: QueryLifecycleApi
+  }: QueryLifecycleApi,
 ): Promise<void>
 ```
 
@@ -671,7 +772,7 @@ async function onCacheEntryAdded(
     cacheEntryRemoved,
     cacheDataLoaded,
     getCacheEntry,
-  }: MutationCacheLifecycleApi
+  }: MutationCacheLifecycleApi,
 ): Promise<void>
 ```
 
@@ -687,7 +788,7 @@ async function onCacheEntryAdded(
     cacheDataLoaded,
     getCacheEntry,
     updateCachedData, // available for query endpoints only
-  }: QueryCacheLifecycleApi
+  }: QueryCacheLifecycleApi,
 ): Promise<void>
 ```
 

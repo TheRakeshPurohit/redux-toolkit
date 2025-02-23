@@ -6,17 +6,16 @@ import {
 
 const api = createApi({
   baseQuery: fetchBaseQuery({ baseUrl: 'https://pokeapi.co/api/v2' }),
-  endpoints: (builder) => ({
-    getPokemonByName: builder.query({
+  endpoints: (build) => ({
+    getPokemonByName: build.query({
       query: (name: string) => `pokemon/${name}`,
     }),
   }),
 })
 
 function Pokemon() {
-  const { data, refetch, isFetching } = api.useGetPokemonByNameQuery(
-    'bulbasaur'
-  )
+  const { data, refetch, isFetching } =
+    api.useGetPokemonByNameQuery('bulbasaur')
 
   return (
     <div>
